@@ -1,54 +1,48 @@
 import os
 from groq import Groq
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
+from models import Message
 
 # Initialize Groq client
-# Provide a dummy string if the API key is not set so the app doesn't crash on startup
 groq_api_key = os.getenv("GROQ_API_KEY", "")
 client = Groq(api_key=groq_api_key)
 
-def process_incoming_message(text: str) -> dict:
+def generate_ai_reply(phone_number: str, text: str, db: Session) -> str:
     """
-    Calls Groq to classify the message intent and generate a reply.
+    Calls Groq to generate a conversational reply based on DB history.
     """
     if not groq_api_key:
-        return {
-            "classification": "api_key_missing",
-            "reply": "Error: GROQ_API_KEY is not configured."
-        }
+        return "Error: GROQ_API_KEY is not configured."
 
-    prompt = f"""
-Classify the intent of this SMS and generate a short helpful reply.
+    # Fetch last 10 messages for context, oldest first
+    history = db.query(Message).filter(Message.phone_number == phone_number).order_by(desc(Message.created_at)).limit(10).all()
+    history.reverse()
 
-Message:
-"{text}"
+    messages = [
+        {"role": "system", "content": "You are a helpful SMS customer support assistant. Keep replies concise, friendly, and helpful."}
+    ]
 
-Return exactly valid JSON with the following format:
-{{
-    "classification": "<short 1-3 word intent>",
-    "reply": "<the short suggested reply message>"
-}}
-"""
+    for msg in history:
+        # Don't duplicate the current incoming message if it was already saved
+        if msg.message_text == text and msg.direction == "incoming" and msg == history[-1]:
+            continue
+            
+        role = "user" if msg.direction == "incoming" else "assistant"
+        if msg.message_text:
+            messages.append({"role": role, "content": msg.message_text})
+
+    messages.append({"role": "user", "content": text})
+
     try:
         completion = client.chat.completions.create(
-            model="llama3-8b-8192",  # Fast and robust model
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant. Always respond with only valid JSON based on the prompt's schema requirements."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
+            model="llama-3.1-8b-instant",  # Fast and robust model
+            messages=messages,
+            temperature=0.6,
             max_tokens=150
         )
-        response_content = completion.choices[0].message.content
-        import json
-        result = json.loads(response_content)
-        return {
-            "classification": result.get("classification", "unknown"),
-            "reply": result.get("reply", "I'm sorry, I couldn't understand that.")
-        }
+        return completion.choices[0].message.content
+        
     except Exception as e:
-        print(f"Error calling Groq: {e}")
-        return {
-            "classification": "error",
-            "reply": "Error processing message via AI."
-        }
+        print(f"Error calling Groq conversational AI: {e}")
+        return "Error processing conversational message via AI."

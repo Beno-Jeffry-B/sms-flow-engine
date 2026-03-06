@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 from db import get_db
 from models import Message
 import os
+from ai import generate_ai_reply
+from state import app_state
 from routes.sms import SURGE_API_KEY, SURGE_API_URL
 
 router = APIRouter()
@@ -12,35 +14,6 @@ router = APIRouter()
 class SurgeWebhook(BaseModel):
     phone_number: str
     message_text: str
-
-def classify_message(text: str) -> str:
-    msg = text.lower()
-    
-    pricing_keywords = ["price", "pricing", "cost", "plan", "subscription"]
-    support_keywords = ["help", "issue", "problem", "support", "not working"]
-    
-    if any(k in msg for k in pricing_keywords):
-        return "pricing_query"
-        
-    if any(k in msg for k in support_keywords):
-        return "support_request"
-        
-    if "?" in msg:
-        return "general_question"
-        
-    return "other"
-
-def generate_reply(intent: str):
-    if intent == "pricing_query":
-        return "Thanks for your interest! Pricing starts at $9/month."
-        
-    if intent == "support_request":
-        return "Support team will assist you shortly."
-        
-    if intent == "general_question":
-        return "Thanks for reaching out. We'll respond soon."
-        
-    return None
 
 @router.post("/webhook/surge")
 async def webhook_surge(payload: SurgeWebhook, db: Session = Depends(get_db)):
@@ -52,22 +25,25 @@ async def webhook_surge(payload: SurgeWebhook, db: Session = Depends(get_db)):
     phone_number = payload.phone_number
     message_text = payload.message_text
 
-    intent = classify_message(message_text)
-    reply = generate_reply(intent)
-
     # 1. Store incoming message in DB
     incoming_message = Message(
         phone_number=phone_number,
         direction="incoming",
         message_text=message_text,
-        ai_classification=intent,
-        ai_response=reply,
         webhook_payload=payload.dict(),
         status="received"
     )
     db.add(incoming_message)
     db.commit()
     db.refresh(incoming_message)
+
+    # 2. Ai Autoreply
+    reply = None
+    if app_state["auto_reply_enabled"]:
+        reply = generate_ai_reply(phone_number, message_text, db)
+        incoming_message.ai_response = reply
+        incoming_message.ai_classification = "conversational_ai"
+        db.commit()
 
     # 2. Auto-send reply SMS
     if reply:
@@ -109,6 +85,6 @@ async def webhook_surge(payload: SurgeWebhook, db: Session = Depends(get_db)):
         "status": "received",
         "phone_number": phone_number,
         "message_text": message_text,
-        "intent": intent,
+        "intent": incoming_message.ai_classification,
         "auto_reply": reply
     }
